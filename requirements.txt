@@ -1,2 +1,9 @@
-oauth2
-evernote3
+pandas
+openai
+dotenv
+tqdm
+fastapi
+pydantic
+uvicorn
+gspread 
+oauth2client
