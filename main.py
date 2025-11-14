@@ -5,25 +5,15 @@ from openai import OpenAI
 from tqdm import tqdm
 from utils import *
 from tools import *
+from services import *
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import Any, Dict, Optional
 import uvicorn
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
-
-
-JSON_KEYFILE = './service-account-creds.json'
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEYFILE, scope)
-gc_client = gspread.authorize(creds)
-spreadsheets = gc_client.openall()
-
-
-load_dotenv(dotenv_path="../.env")
-client = OpenAI(api_key=os.getenv("OPEN_API_KEY"))
 
 app = FastAPI()
 
@@ -37,181 +27,53 @@ class AssistantResponse(BaseModel):
 @app.post("/assist", response_model=AssistantResponse)
 async def assist(request: AssistantRequest):
     user_input = request.user_input.strip()
-    if not user_input:
-        raise HTTPException(status_code=400, detail="Empty input not allowed.")
-    
-    # region Step 1: Getting Intent
-    notes_path_dict = build_notes_index("./notes")
-    notes_list = list(notes_path_dict.values())
-
-    print("notes path dict: " ,notes_path_dict)
-    print(f"Notes found: {len(notes_list)}")
-
-
-    intnt_prmpt_file = "./prompts/get_intent.txt"
-    with open(intnt_prmpt_file, "r", encoding="utf-8") as f:
-        intnt_prmpt = f.read()
-
-    notes_desc_path = "./note_descriptions.json"
-    with open(notes_desc_path, "r", encoding="utf-8") as f:
-        note_desc = json.load(f)
-    
-    intnt_response = get_llm_response(
-        user_prompt=intnt_prmpt.format(user_query = user_input , note_list = notes_list, note_desc = json.dumps(note_desc)),
-        model="gpt-4o-mini",
-        get_tokens=True
-    )
-    
     try:
-        intent_data = jsonify_output(intnt_response["response"])
-
+        result = await process_user_input(user_input)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM response parsing error: {e}")
-    # endregion
-
-    # region Step 2: Performing Action Based on Intent
-    action_reasoning = intent_data.get('reasoning', 'No reasoning provided.')
-    action_intent = intent_data['intent']
-    action_note = intent_data['note']
-    print("Determined Intent: ", intent_data['intent'] , "\n Note: ", intent_data['note'], " \n Reasoning: ", action_reasoning)
-
-    if action_note == "no_match":
-        raise HTTPException(status_code=400, detail="No matching note found for the given input.")
-
-    elif intent_data['intent'] not in ["retrieve_info", "edit_note"]:
-        raise HTTPException(status_code=400, detail="Invalid intent detected.")
-
-    elif intent_data['intent'] == "retrieve_info":
-        action_prompt_fname = os.path.join("./prompts", f"{action_intent}.txt")
-        with open(action_prompt_fname, "r") as f:
-            action_prompt_template = f.read()
-
-        action_note_fname = notes_path_dict.get(action_note, None)
-        with open(action_note_fname, "r") as f:
-            action_note_content = f.read()
-
-        input_list = [
-            {
-                "role": "user",
-                "content": action_prompt_template.format(
-                    user_query=user_input,
-                    note_content=action_note_content,
-                )
-            }
-        ]
-        # 2. Prompt the model with tools defined
-        action_response = client.responses.create(
-            model="gpt-5",
-            tools=[
-                {
-                "type": "web_search",
-                "user_location": {"type": "approximate"},
-                "search_context_size": "low"
-                },
-            ],
-            input=input_list,
-            tool_choice="auto",
-            store=False,
-            reasoning={"effort": "low"},
-        )
-
-        try:
-            final_output = jsonify_output(action_response.output_text)['final_text']
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"LLM action response parsing error: {e}")
-
-        print("Final Output: \n", final_output)
-
-    elif intent_data['intent'] == "edit_note":
-        if intent_data['note'] == "progressive_overload_tracking.xlsx":
-            # Handle progressive overload tracking update
-            sheet = gc_client.open("progressive_overload_tracking").sheet1
-            df = pd.DataFrame(sheet.get_all_records())
-            exercise_table_str = df[['muscle area', 'exercise name']].to_string(index=False)
-
-            prog_over_prmpt_file = "./prompts/progressive_overloading_tracking.txt"
-            with open(prog_over_prmpt_file, "r", encoding="utf-8") as f:
-                PROG_OVER_PROMPT = f.read()
-
-            input_list = [
-                {
-                    "role": "user",
-                    "content": PROG_OVER_PROMPT.format(
-                        user_input=user_input,
-                        exercise_table=exercise_table_str
-                    )
-                }
-            ]
-            # 2. Prompt the model with tools defined
-            response = client.responses.create(
-                model="gpt-5",
-                tools=prog_over_tools,
-                input=input_list,
-                tool_choice="auto"
-                
-            )
-            for item in response.output:
-                if item.type == "function_call":
-                    print(item.name)
-                    if item.name == "modify_week":
-                        args = jsonify_output(item.arguments)['muscle_areas']
-                        modify_week(df, args)
-                    elif item.name == "modify_weight":
-                        args = jsonify_output(item.arguments)['updates']
-                        modify_weight(df, args)
-                    else:
-                        print("Unknown function:", item.name)
-            # Save back to Google Sheets
-            sheet.clear()
-            sheet.update([df.columns.values.tolist()] + df.values.tolist())
-
-        elif intent_data['note'] == "calorie_tracking.xlsx":
-            # Handle calorie tracking update
-            sheet = gc_client.open("calorie_tracking").sheet1
-            df = pd.DataFrame(sheet.get_all_records())
-            
-            calorie_tracker_path = "./prompts/calorie_tracking.txt"
-            with open(calorie_tracker_path, "r", encoding="utf-8") as f:
-                CLR_TRCK_PROMPT = f.read()
-
-            input_list = [
-                {
-                    "role": "user",
-                    "content": CLR_TRCK_PROMPT.format(
-                        user_input=user_input
-                    )
-                }
-            ]
-            # 2. Prompt the model with tools defined
-            response = client.responses.create(
-                model="gpt-5",
-                tools=[
-                    {
-                    "type": "web_search",
-                    "user_location": {"type": "approximate"},
-                    "search_context_size": "low"
-                    },
-                ],
-                input=input_list,
-                tool_choice="auto",
-                store=False,
-                reasoning={"effort": "low"},
-            )    
-
-            result = jsonify_output(response.output_text)
-            items = result["items"]
-            update_status = update_calorie_tracker(items, df)
-            df = update_status["final_df"]
-
-            sheet.clear()
-            sheet.update([df.columns.values.tolist()] + df.values.tolist())
-            # print(update_status)
-
+        raise HTTPException(status_code=500, detail=str(e))
     return AssistantResponse(
-        status="success",
-        data={"note_updated": action_note, "intent": action_intent, "error": None}
+        status=result["status"],
+        data=result.get("data", None)
     )
-    # endregion
+
+# Dialogflow webhook endpoint
+@app.post("/dialogflow")
+async def dialogflow_webhook(request: Request):
+    try:
+        req = await request.json()
+        user_text = req["queryResult"]["queryText"]
+        
+        # Call your service
+        result = await process_user_input(user_text)
+        
+        # Extract the data
+        status = result["status"]
+        data = result["data"]
+        note_updated = data["note_updated"]
+        intent = data["intent"]
+        error = data["error"]
+        
+        # Use note_updated as the spoken response
+        if status == "success" and not error:
+            response_text = note_updated  # This gets spoken by Google Assistant
+        else:
+            response_text = error or "Sorry, something went wrong."
+        
+        return {
+            "fulfillmentText": response_text,
+            "google": {
+                "expectUserResponse": False
+            }
+        }
+        
+    except Exception as e:
+        print(f"Dialogflow error: {str(e)}")
+        return {
+            "fulfillmentText": "Sorry, I couldn't process that request."
+        }
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
