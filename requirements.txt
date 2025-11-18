@@ -7,4 +7,5 @@ pydantic
 uvicorn
 gspread 
 oauth2client
-twiliopython-multipart
+twilio
+python-multipart
