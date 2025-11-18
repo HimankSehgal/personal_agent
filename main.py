@@ -14,8 +14,15 @@ import uvicorn
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import os
+from whatsapp_webhook import router as whatsapp_router
 
-app = FastAPI()
+app = FastAPI(
+    title="Personal Agent API",
+    description="API for personal assistant with WhatsApp integration",
+    version="1.0.0"
+)
+
+app.include_router(whatsapp_router)
 
 class AssistantRequest(BaseModel):
     user_input: str

@@ -1,2 +1,6 @@
 service-account-creds.json
 __pycache__/
+pipeline.ipynb
+*.ipynb
+pipeline.ipynb
+*.ipynb
